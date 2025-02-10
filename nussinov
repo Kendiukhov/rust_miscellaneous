@@ -1,0 +1,171 @@
+/// Nussinov algorithm for RNA secondary structure prediction 
+
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
+use std::env;
+use std::time::Instant;
+
+/// Returns whether the two bases can pair (only Watson–Crick A–U and C–G pairs).
+#[inline(always)]
+fn can_pair(a: u8, b: u8) -> bool {
+    match (a, b) {
+        (b'A', b'U') | (b'U', b'A') => true,
+        (b'C', b'G') | (b'G', b'C') => true,
+        _ => false,
+    }
+}
+
+/// Returns the index into a flat vector representing an n×n DP matrix.
+#[inline(always)]
+fn idx(i: usize, j: usize, n: usize) -> usize {
+    i * n + j
+}
+
+/// Compute the DP table using the Nussinov recurrence.
+/// The DP table is stored as a flat vector of size n*n.
+/// 
+/// # Safety and Optimization
+/// An `unsafe` block is used in the inner loops to perform pointer arithmetic
+/// and remove bounds checks. The code is written so that all indices are in bounds.
+fn nussinov(seq: &[u8]) -> Vec<usize> {
+    let n = seq.len();
+    let mut dp = vec![0usize; n * n];
+    unsafe {
+        // Get a mutable pointer to the start of the dp table.
+        let dp_ptr = dp.as_mut_ptr();
+        // l is the length of the subsequence minus one.
+        for l in 1..n {
+            // For every starting index i (with j = i+l)
+            for i in 0..(n - l) {
+                let j = i + l;
+                // We know dp[i][j] depends on:
+                //   - dp[i+1][j]
+                //   - dp[i][j-1]
+                //   - dp[i+1][j-1] + 1 (if seq[i] and seq[j] can pair)
+                //   - partitioning: dp[i][k] + dp[k+1][j] for i < k < j
+                let mut best = *dp_ptr.add(idx(i + 1, j, n));
+                let candidate = *dp_ptr.add(idx(i, j - 1, n));
+                if candidate > best {
+                    best = candidate;
+                }
+                if can_pair(seq[i], seq[j]) {
+                    let candidate = *dp_ptr.add(idx(i + 1, j - 1, n)) + 1;
+                    if candidate > best {
+                        best = candidate;
+                    }
+                }
+                // Consider all possible partitions of the interval.
+                for k in (i + 1)..j {
+                    let candidate = *dp_ptr.add(idx(i, k, n)) + *dp_ptr.add(idx(k + 1, j, n));
+                    if candidate > best {
+                        best = candidate;
+                    }
+                }
+                *dp_ptr.add(idx(i, j, n)) = best;
+            }
+        }
+    }
+    dp
+}
+
+/// Recursively performs the traceback on the DP table to recover the pairing
+/// decisions. The resulting structure is recorded in `structure` (a mutable
+/// byte array that initially contains all dots `.`). Positions that form a pair
+/// are set to '(' and ')' respectively.
+///
+/// The dp table is passed as a slice (using safe indexing via `.get().unwrap()`)
+/// since this part is not performance-critical.
+fn traceback(seq: &[u8], dp: &[usize], i: usize, j: usize, n: usize, structure: &mut [u8]) {
+    if i >= j {
+        return;
+    }
+    // Case 1: Base i is unpaired.
+    if *dp.get(idx(i, j, n)).unwrap() == *dp.get(idx(i + 1, j, n)).unwrap() {
+        traceback(seq, dp, i + 1, j, n, structure);
+        return;
+    }
+    // Case 2: Base j is unpaired.
+    if *dp.get(idx(i, j, n)).unwrap() == *dp.get(idx(i, j - 1, n)).unwrap() {
+        traceback(seq, dp, i, j - 1, n, structure);
+        return;
+    }
+    // Case 3: Bases i and j pair.
+    if can_pair(seq[i], seq[j])
+        && *dp.get(idx(i, j, n)).unwrap() == *dp.get(idx(i + 1, j - 1, n)).unwrap() + 1
+    {
+        structure[i] = b'(';
+        structure[j] = b')';
+        traceback(seq, dp, i + 1, j - 1, n, structure);
+        return;
+    }
+    // Case 4: There is a bifurcation between i and j.
+    for k in (i + 1)..j {
+        if *dp.get(idx(i, j, n)).unwrap()
+            == *dp.get(idx(i, k, n)).unwrap() + *dp.get(idx(k + 1, j, n)).unwrap()
+        {
+            traceback(seq, dp, i, k, n, structure);
+            traceback(seq, dp, k + 1, j, n, structure);
+            return;
+        }
+    }
+}
+
+/// Given an RNA sequence string, computes its optimal secondary structure
+/// (maximizing the number of base pairs) in dot–bracket notation.
+fn predict_structure(seq: &str) -> String {
+    let seq_bytes = seq.as_bytes();
+    let n = seq_bytes.len();
+    if n == 0 {
+        return String::new();
+    }
+    let dp = nussinov(seq_bytes);
+    let mut structure = vec![b'.'; n];
+    traceback(seq_bytes, &dp, 0, n - 1, n, &mut structure);
+    // Convert the byte vector to a String (it is valid UTF-8 because it is ASCII).
+    String::from_utf8(structure).unwrap()
+}
+
+/// Main function: accepts an RNA sequence as an optional command-line argument.
+/// If no argument is provided, a default sequence is used. The predicted structure
+/// and timing information are printed.
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    let sequence = if args.len() > 1 {
+        // Convert the input sequence to uppercase.
+        args[1].to_uppercase()
+    } else {
+        // Default example RNA sequence.
+        String::from("GCGCUUCGCC")
+    };
+
+    println!("RNA Sequence: {}", sequence);
+    let start = Instant::now();
+    let structure = predict_structure(&sequence);
+    let elapsed = start.elapsed();
+    println!("Predicted Structure: {}", structure);
+    println!("Elapsed time: {:.2?}", elapsed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_nussinov_prediction() {
+        let sequence = "GCGCUUCGCC";
+        let structure = predict_structure(sequence);
+        // Verify that the structure has the same length as the sequence.
+        assert_eq!(structure.len(), sequence.len());
+        // Check that parentheses are balanced.
+        let mut balance = 0;
+        for c in structure.bytes() {
+            if c == b'(' {
+                balance += 1;
+            } else if c == b')' {
+                balance -= 1;
+            }
+            assert!(balance >= 0, "Unbalanced at some point in {}", structure);
+        }
+        assert_eq!(balance, 0, "Final balance nonzero in {}", structure);
+    }
+}
