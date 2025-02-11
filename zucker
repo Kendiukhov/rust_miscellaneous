@@ -1,0 +1,319 @@
+/// Zucker algorithm for RNA secondary structure prediction
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
+use std::env;
+use std::time::Instant;
+
+/// Minimal number of unpaired bases required in a loop.
+const TURN: usize = 3;
+/// Maximum number of unpaired bases allowed in an interior loop.
+const MAX_LOOP: usize = 30;
+/// A very large energy value to represent “impossible” states.
+const INF: f64 = 1e9;
+/// Tolerance for floating point comparisons.
+const EPS: f64 = 1e-6;
+
+/// Returns true if the two bases can form a canonical pair (Watson–Crick).
+#[inline(always)]
+fn can_pair(a: u8, b: u8) -> bool {
+    match (a, b) {
+        (b'A', b'U') | (b'U', b'A') => true,
+        (b'C', b'G') | (b'G', b'C') => true,
+        _ => false,
+    }
+}
+
+/// Compute a flat–vector index for an n×n matrix.
+#[inline(always)]
+fn idx(i: usize, j: usize, n: usize) -> usize {
+    i * n + j
+}
+
+/// Compare two f64 values for approximate equality.
+#[inline(always)]
+fn feq(a: f64, b: f64) -> bool {
+    (a - b).abs() < EPS
+}
+
+/// A simplified hairpin loop energy function.
+/// For a loop of length L = j – i – 1, we use a base cost plus a per–nucleotide penalty.
+#[inline(always)]
+fn hairpin_energy(loop_length: usize) -> f64 {
+    if loop_length < TURN {
+        INF
+    } else {
+        3.0 + 0.2 * loop_length as f64
+    }
+}
+
+/// A simplified stacking energy function.  
+/// (In real models, the stacking energy depends on the identities of the paired bases.)
+#[inline(always)]
+fn stacking_energy(a: u8, b: u8, c: u8, d: u8) -> f64 {
+    if can_pair(a, b) && can_pair(c, d) {
+        -2.0
+    } else {
+        INF
+    }
+}
+
+/// A simplified interior loop energy function.  
+/// The loop size is the number of unpaired bases in the two “arms.”
+#[inline(always)]
+fn interior_loop_energy(i: usize, j: usize, k: usize, l: usize) -> f64 {
+    let loop_size = (k - i - 1) + (j - l - 1);
+    1.0 + 0.1 * loop_size as f64
+}
+
+/// Compute the DP matrices for minimum free energy folding using Zuker’s algorithm.
+///
+/// The matrices are stored as flat vectors:
+/// - V[i,j] is the energy for the subsequence [i,j] assuming i and j form a pair.
+/// - W[i,j] is the energy for the best structure on [i,j].
+fn zuker(seq: &[u8]) -> (Vec<f64>, Vec<f64>) {
+    let n = seq.len();
+    let size = n * n;
+    let mut V = vec![INF; size];
+    let mut W = vec![0.0; size];
+
+    // Base cases: for intervals of length 0 (or i == j), no structure is possible.
+    for i in 0..n {
+        W[idx(i, i, n)] = 0.0;
+    }
+
+    // Fill the matrices for increasing interval lengths.
+    for l in 1..n {
+        for i in 0..(n - l) {
+            let j = i + l;
+            // For intervals that are too short to allow a pairing,
+            // the optimum structure is empty.
+            if j - i < TURN + 1 {
+                W[idx(i, j, n)] = 0.0;
+                V[idx(i, j, n)] = INF;
+                continue;
+            }
+
+            let mut v = INF;
+            // Consider pairing i and j if allowed.
+            if can_pair(seq[i], seq[j]) {
+                // Hairpin loop candidate.
+                let hairpin = hairpin_energy(j - i - 1);
+                v = hairpin;
+
+                // Stacking candidate: if the inner pair exists.
+                if i + 1 < j && can_pair(seq[i + 1], seq[j - 1]) {
+                    let candidate = V[idx(i + 1, j - 1, n)] 
+                        + stacking_energy(seq[i], seq[j], seq[i + 1], seq[j - 1]);
+                    if candidate < v {
+                        v = candidate;
+                    }
+                }
+
+                // Interior loops (including bulges).
+                // We restrict the total number of unpaired bases to MAX_LOOP.
+                unsafe {
+                    let V_ptr = V.as_ptr();
+                    for k in (i + 1)..(j - 1) {
+                        for l in (k + 1)..j {
+                            if (k - i - 1) + (j - l - 1) > MAX_LOOP {
+                                continue;
+                            }
+                            if !can_pair(seq[k], seq[l]) {
+                                continue;
+                            }
+                            let candidate = *V_ptr.add(idx(k, l, n))
+                                + interior_loop_energy(i, j, k, l);
+                            if candidate < v {
+                                v = candidate;
+                            }
+                        }
+                    }
+                }
+            }
+            V[idx(i, j, n)] = v;
+
+            // Now compute W(i,j) as the best over several alternatives:
+            // 1. A structure with i and j paired (V[i,j]),
+            // 2. Leaving base i unpaired,
+            // 3. Leaving base j unpaired,
+            // 4. Bifurcating the interval [i,j] into two independent intervals.
+            let mut w = v;
+            if i + 1 <= j {
+                let candidate = W[idx(i + 1, j, n)];
+                if candidate < w {
+                    w = candidate;
+                }
+            }
+            if i <= j - 1 {
+                let candidate = W[idx(i, j - 1, n)];
+                if candidate < w {
+                    w = candidate;
+                }
+            }
+            for k in i..j {
+                let candidate = W[idx(i, k, n)] + W[idx(k + 1, j, n)];
+                if candidate < w {
+                    w = candidate;
+                }
+            }
+            W[idx(i, j, n)] = w;
+        }
+    }
+    (V, W)
+}
+
+/// Traceback on the W–matrix to recover the dot–bracket structure.
+///
+/// This routine works by checking which decision (unpairing, bifurcation, or pairing)
+/// produced the optimum on [i,j]. (Floating–point comparisons are done with tolerance EPS.)
+fn traceback_w(
+    seq: &[u8],
+    i: usize,
+    j: usize,
+    V: &[f64],
+    W: &[f64],
+    n: usize,
+    structure: &mut [u8],
+) {
+    if i >= j {
+        return;
+    }
+    if j - i < TURN + 1 {
+        return;
+    }
+
+    // Case 1: Best structure comes from leaving i unpaired.
+    if i + 1 <= j && feq(W[idx(i, j, n)], W[idx(i + 1, j, n)]) {
+        traceback_w(seq, i + 1, j, V, W, n, structure);
+        return;
+    }
+    // Case 2: Best structure comes from leaving j unpaired.
+    if i <= j - 1 && feq(W[idx(i, j, n)], W[idx(i, j - 1, n)]) {
+        traceback_w(seq, i, j - 1, V, W, n, structure);
+        return;
+    }
+    // Case 3: Bifurcation of the interval.
+    for k in i..j {
+        if feq(W[idx(i, j, n)], W[idx(i, k, n)] + W[idx(k + 1, j, n)]) {
+            traceback_w(seq, i, k, V, W, n, structure);
+            traceback_w(seq, k + 1, j, V, W, n, structure);
+            return;
+        }
+    }
+    // Case 4: The best structure comes from a pairing (i,j) as computed in V.
+    if can_pair(seq[i], seq[j]) && feq(W[idx(i, j, n)], V[idx(i, j, n)]) {
+        structure[i] = b'(';
+        structure[j] = b')';
+        traceback_v(seq, i, j, V, W, n, structure);
+        return;
+    }
+}
+
+/// Traceback on the V–matrix. This recovers the structural details for a closed
+/// substructure in which bases i and j are paired.
+fn traceback_v(
+    seq: &[u8],
+    i: usize,
+    j: usize,
+    V: &[f64],
+    _W: &[f64],
+    n: usize,
+    structure: &mut [u8],
+) {
+    // If the energy equals that of a hairpin, nothing further needs to be done.
+    if j > i && feq(V[idx(i, j, n)], hairpin_energy(j - i - 1)) {
+        return;
+    }
+    // Check for a stacking candidate.
+    if i + 1 < j && can_pair(seq[i + 1], seq[j - 1]) {
+        let candidate = V[idx(i + 1, j - 1, n)]
+            + stacking_energy(seq[i], seq[j], seq[i + 1], seq[j - 1]);
+        if feq(V[idx(i, j, n)], candidate) {
+            structure[i + 1] = b'(';
+            structure[j - 1] = b')';
+            traceback_v(seq, i + 1, j - 1, V, _W, n, structure);
+            return;
+        }
+    }
+    // Try to identify an interior loop candidate.
+    for k in (i + 1)..(j - 1) {
+        for l in (k + 1)..j {
+            if (k - i - 1) + (j - l - 1) > MAX_LOOP {
+                continue;
+            }
+            if !can_pair(seq[k], seq[l]) {
+                continue;
+            }
+            let candidate = V[idx(k, l, n)] + interior_loop_energy(i, j, k, l);
+            if feq(V[idx(i, j, n)], candidate) {
+                structure[k] = b'(';
+                structure[l] = b')';
+                traceback_v(seq, k, l, V, _W, n, structure);
+                return;
+            }
+        }
+    }
+}
+
+/// Given an RNA sequence, computes its minimum free energy (MFE) secondary
+/// structure in dot–bracket notation along with the associated energy value.
+///
+/// Note: This is a simplified version of Zuker’s algorithm.
+fn predict_structure(seq: &str) -> (f64, String) {
+    let seq_bytes = seq.as_bytes();
+    let n = seq_bytes.len();
+    if n == 0 {
+        return (0.0, String::new());
+    }
+    let (V, W) = zuker(seq_bytes);
+    let mut structure = vec![b'.'; n];
+    traceback_w(seq_bytes, 0, n - 1, &V, &W, n, &mut structure);
+    let energy = W[idx(0, n - 1, n)];
+    let structure_str = String::from_utf8(structure).unwrap();
+    (energy, structure_str)
+}
+
+/// Main function: accepts an RNA sequence as an optional command-line argument.
+/// If no sequence is provided, a default example is used.
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    let sequence = if args.len() > 1 {
+        args[1].to_uppercase()
+    } else {
+        String::from("GCGCUUCGCC")
+    };
+
+    println!("RNA Sequence: {}", sequence);
+    let start = Instant::now();
+    let (energy, structure) = predict_structure(&sequence);
+    let elapsed = start.elapsed();
+    println!("Predicted Structure: {}", structure);
+    println!("Minimum Free Energy: {:.2}", energy);
+    println!("Elapsed time: {:.2?}", elapsed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_zuker_prediction() {
+        let sequence = "GCGCUUCGCC";
+        let (energy, structure) = predict_structure(sequence);
+        // The structure should have the same length as the sequence.
+        assert_eq!(structure.len(), sequence.len());
+        // Verify that the parentheses are balanced.
+        let mut balance = 0;
+        for &c in structure.as_bytes() {
+            if c == b'(' {
+                balance += 1;
+            } else if c == b')' {
+                balance -= 1;
+            }
+            assert!(balance >= 0, "Unbalanced at some point in {}", structure);
+        }
+        assert_eq!(balance, 0, "Final balance nonzero in {}", structure);
+        // (Energy is model–dependent; here we simply check that it is not INF.)
+        assert!(energy < INF, "Energy should be finite");
+    }
+}
