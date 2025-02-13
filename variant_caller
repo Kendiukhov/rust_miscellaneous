@@ -1,0 +1,233 @@
+/// A simplified—but highly performant—variant caller implemented in Rust.
+
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
+use std::env;
+use std::time::Instant;
+
+/// A structure representing an aligned sequencing read.
+#[derive(Debug)]
+struct Read {
+    /// The 0-indexed start position on the reference.
+    start: usize,
+    /// The read’s nucleotide sequence.
+    sequence: String,
+}
+
+/// A structure representing a variant call.
+#[derive(Debug)]
+struct VariantCall {
+    /// 0-indexed reference position.
+    pos: usize,
+    /// Reference nucleotide at this position.
+    ref_base: char,
+    /// Alternate nucleotide observed.
+    alt_base: char,
+    /// Count of reads matching the reference.
+    ref_count: usize,
+    /// Count of reads supporting the alternate allele.
+    alt_count: usize,
+}
+
+/// Convert a nucleotide character to an index (A=0, C=1, G=2, T=3).
+#[inline(always)]
+fn base_to_index(base: char) -> Option<usize> {
+    match base {
+        'A' | 'a' => Some(0),
+        'C' | 'c' => Some(1),
+        'G' | 'g' => Some(2),
+        'T' | 't' => Some(3),
+        _ => None,
+    }
+}
+
+/// Convert an index back to a nucleotide character.
+#[inline(always)]
+fn index_to_base(idx: usize) -> char {
+    match idx {
+        0 => 'A',
+        1 => 'C',
+        2 => 'G',
+        3 => 'T',
+        _ => 'N',
+    }
+}
+
+/// Perform variant detection via a simple pileup approach.
+///
+/// For each position in the reference, we tally counts for A, C, G, and T from the reads.
+/// If the most frequent allele that is different from the reference reaches the given
+/// frequency threshold (and the coverage exceeds a minimum), we call a variant.
+///
+/// # Arguments
+/// - `reference`: The reference sequence.
+/// - `reads`: A slice of aligned reads.
+/// - `min_alt_freq`: The minimum frequency (0.0–1.0) required to call a variant.
+/// - `min_depth`: The minimum total coverage required to consider variant calling.
+///
+/// # Returns
+/// A vector of `VariantCall` objects representing detected SNVs.
+fn call_variants(
+    reference: &str,
+    reads: &[Read],
+    min_alt_freq: f64,
+    min_depth: usize,
+) -> Vec<VariantCall> {
+    let ref_chars: Vec<char> = reference.chars().collect();
+    let ref_len = ref_chars.len();
+
+    // Initialize a pileup vector: for each reference position we hold counts for A, C, G, T.
+    let mut pileup: Vec<[usize; 4]> = vec![[0; 4]; ref_len];
+
+    // Process each read: update counts for positions covered by the read.
+    for read in reads {
+        // Convert the read sequence into characters.
+        let read_chars: Vec<char> = read.sequence.chars().collect();
+        for (i, &base) in read_chars.iter().enumerate() {
+            let pos = read.start + i;
+            if pos >= ref_len {
+                break; // Avoid overrunning the reference.
+            }
+            if let Some(idx) = base_to_index(base) {
+                pileup[pos][idx] += 1;
+            }
+        }
+    }
+
+    let mut variants = Vec::new();
+
+    // Analyze the pileup at each reference position.
+    for pos in 0..ref_len {
+        let ref_base = ref_chars[pos];
+        let ref_idx = match base_to_index(ref_base) {
+            Some(idx) => idx,
+            None => continue, // Skip positions with ambiguous bases in the reference.
+        };
+
+        let counts = pileup[pos];
+        let depth: usize = counts.iter().sum();
+        if depth < min_depth {
+            continue; // Not enough coverage.
+        }
+
+        // Identify the most frequent allele different from the reference.
+        let mut alt_idx = None;
+        let mut alt_count = 0;
+        for i in 0..4 {
+            if i == ref_idx {
+                continue;
+            }
+            if counts[i] > alt_count {
+                alt_count = counts[i];
+                alt_idx = Some(i);
+            }
+        }
+        if let Some(alt_idx) = alt_idx {
+            let alt_freq = alt_count as f64 / depth as f64;
+            if alt_freq >= min_alt_freq {
+                // Create a variant call.
+                variants.push(VariantCall {
+                    pos,
+                    ref_base,
+                    alt_base: index_to_base(alt_idx),
+                    ref_count: counts[ref_idx],
+                    alt_count,
+                });
+            }
+        }
+    }
+
+    variants
+}
+
+/// Main function demonstrating a simplified variant detection pipeline.
+fn main() {
+    // For demonstration purposes, we use a hard-coded reference sequence.
+    let reference = "ACGTACGTACGTACGTACGT";
+
+    // Simulated reads aligned to the reference.
+    // In a real tool, these would come from an alignment file (e.g., BAM).
+    let reads = vec![
+        Read {
+            start: 0,
+            sequence: String::from("ACGTACGTACGT"),
+        },
+        Read {
+            start: 4,
+            sequence: String::from("ACGTACGTACGT"),
+        },
+        // Introduce a variant: these two reads have a mismatch (T instead of A) at position 12.
+        Read {
+            start: 8,
+            sequence: String::from("ACGTTCGTACGT"),
+        },
+        Read {
+            start: 8,
+            sequence: String::from("ACGTTCGTACGT"),
+        },
+        // One read supports the reference at this region.
+        Read {
+            start: 8,
+            sequence: String::from("ACGTACGTACGT"),
+        },
+    ];
+
+    // Variant calling parameters:
+    // - A variant is called if at least 30% of the reads at a position support the alternate allele.
+    // - Only positions with at least 3 reads (min_depth) are considered.
+    let min_alt_freq = 0.3;
+    let min_depth = 3;
+
+    println!("Reference: {}", reference);
+    println!("Reads:");
+    for read in &reads {
+        println!("Start: {:2} | Sequence: {}", read.start, read.sequence);
+    }
+
+    let start_time = Instant::now();
+    let variants = call_variants(reference, &reads, min_alt_freq, min_depth);
+    let elapsed = start_time.elapsed();
+
+    println!("\nDetected Variants:");
+    for var in &variants {
+        println!(
+            "Pos: {:2} | Ref: {} | Alt: {} | Ref Count: {:2} | Alt Count: {:2}",
+            var.pos, var.ref_base, var.alt_base, var.ref_count, var.alt_count
+        );
+    }
+    println!("Elapsed time: {:.2?}", elapsed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_variant_calling() {
+        let reference = "ACGTACGTACGT";
+        let reads = vec![
+            Read {
+                start: 0,
+                sequence: String::from("ACGTACGTACGT"),
+            },
+            Read {
+                start: 0,
+                sequence: String::from("ACGTACGTACGT"),
+            },
+            // Introduce a mismatch at position 4 (0-indexed) where the reference is 'A'
+            // and the read has 'T'.
+            Read {
+                start: 0,
+                sequence: String::from("ACGTTCGTACGT"),
+            },
+        ];
+        // With two reads supporting the reference and one the alternate,
+        // the alternate frequency is 1/3 ≈ 0.33.
+        let variants = call_variants(reference, &reads, 0.3, 2);
+        assert_eq!(variants.len(), 1);
+        let var = &variants[0];
+        assert_eq!(var.pos, 4);
+        assert_eq!(var.ref_base, 'A');
+        assert_eq!(var.alt_base, 'T');
+    }
+}
