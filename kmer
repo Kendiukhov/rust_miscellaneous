@@ -1,0 +1,143 @@
+/// A high-performance k-mer implementation
+
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
+use rayon::prelude::*;
+use std::collections::HashMap;
+use std::env;
+use std::time::Instant;
+
+/// Convert a nucleotide (ASCII) to its 2–bit representation.
+/// A -> 0, C -> 1, G -> 2, T -> 3. Non–ACGT bases default to 0.
+#[inline(always)]
+fn nuc_to_bits(b: u8) -> u8 {
+    match b {
+        b'A' | b'a' => 0,
+        b'C' | b'c' => 1,
+        b'G' | b'g' => 2,
+        b'T' | b't' => 3,
+        _ => 0,
+    }
+}
+
+/// Count k–mers across a slice of sequences. Each k–mer is encoded in a u64.
+/// For a k–mer of length `k`, we use 2*k bits, so k should be ≤ 32.
+fn count_kmers(seqs: &[&str], k: usize) -> HashMap<u64, u32> {
+    // Use Rayon to process sequences in parallel.
+    seqs.par_iter().fold(
+        || HashMap::new(),
+        |mut local_map, seq| {
+            let bytes = seq.as_bytes();
+            if bytes.len() < k {
+                return local_map;
+            }
+            let mut kmer: u64 = 0;
+            // Build the first k–mer.
+            for i in 0..k {
+                kmer = (kmer << 2) | (nuc_to_bits(bytes[i]) as u64);
+            }
+            *local_map.entry(kmer).or_insert(0) += 1;
+            // Mask to maintain only 2*k bits.
+            let mask: u64 = (1 << (2 * k)) - 1;
+            for &b in &bytes[k..] {
+                kmer = ((kmer << 2) | (nuc_to_bits(b) as u64)) & mask;
+                *local_map.entry(kmer).or_insert(0) += 1;
+            }
+            local_map
+        },
+    )
+    .reduce(
+        || HashMap::new(),
+        |mut map1, map2| {
+            for (kmer, count) in map2 {
+                *map1.entry(kmer).or_insert(0) += count;
+            }
+            map1
+        },
+    )
+}
+
+/// Convert an encoded k–mer (u64) back to a nucleotide string of length k.
+fn kmer_to_string(mut kmer: u64, k: usize) -> String {
+    let mut chars = vec!['A'; k];
+    for i in (0..k).rev() {
+        let bits = (kmer & 0b11) as u8;
+        chars[i] = match bits {
+            0 => 'A',
+            1 => 'C',
+            2 => 'G',
+            3 => 'T',
+            _ => 'N',
+        };
+        kmer >>= 2;
+    }
+    chars.into_iter().collect()
+}
+
+/// Main function demonstrating high–performance k–mer counting.
+/// The program uses a few hard–coded sequences (simulating FASTA/FASTQ input),
+/// counts all k–mers of a specified length, and prints the top 10 most frequent k–mers.
+fn main() {
+    // Example sequences (in a real tool these would be read from files)
+    let sequences = vec![
+        "ACGTACGTACGT",
+        "ACGTACGTACGT",
+        "ACGTTCGTACGT",
+        "ACGTACGTACGT",
+        "TGCATGCATGCA",
+    ];
+
+    // Allow specifying k via the command line, default to 4.
+    let args: Vec<String> = env::args().collect();
+    let k = if args.len() > 1 {
+        args[1].parse::<usize>().unwrap_or(4)
+    } else {
+        4
+    };
+
+    println!("Counting {}–mers...", k);
+    let start = Instant::now();
+    let kmer_counts = count_kmers(&sequences, k);
+    let elapsed = start.elapsed();
+    println!("Elapsed time: {:.2?}", elapsed);
+
+    // Sort and display the top 10 most frequent k–mers.
+    let mut kmer_vec: Vec<(u64, u32)> = kmer_counts.into_iter().collect();
+    kmer_vec.sort_by(|a, b| b.1.cmp(&a.1));
+    println!("Top {}–mers:", k);
+    for (i, (kmer, count)) in kmer_vec.iter().take(10).enumerate() {
+        println!("{:2}: {}  — Count: {}", i + 1, kmer_to_string(*kmer, k), count);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_kmer_encoding() {
+        // Test that "ACGT" is encoded and decoded correctly.
+        let k = 4;
+        let s = "ACGT";
+        let bytes = s.as_bytes();
+        let mut kmer: u64 = 0;
+        for &b in bytes {
+            kmer = (kmer << 2) | (nuc_to_bits(b) as u64);
+        }
+        assert_eq!(kmer_to_string(kmer, k), s);
+    }
+    
+    #[test]
+    fn test_count_kmers() {
+        // For the sequence "ACGTACGT", the 4–mers are: ACGT, CGTA, GTAC, TACG, ACGT.
+        let seqs = vec!["ACGTACGT"];
+        let counts = count_kmers(&seqs, 4);
+        // "ACGT" should appear twice.
+        let mut kmer: u64 = 0;
+        for b in "ACGT".as_bytes() {
+            kmer = (kmer << 2) | (nuc_to_bits(*b) as u64);
+        }
+        assert_eq!(counts.get(&kmer).copied().unwrap_or(0), 2);
+    }
+}
